@@ -28,9 +28,7 @@ __global__ void initSpeedPhi(unsigned char* intensity, unsigned char* labels, si
 __global__ void switchIn(signed char* speed, signed char* phi, int HEIGHT, int WIDTH);
 __global__ void switchOut(signed char* speed, signed char* phi, int HEIGHT, int WIDTH);
 
-__global__ void checkStopCondition(signed char* speed, signed char* phi, int parentThreadID, int HEIGHT, int WIDTH);
-__device__ volatile int stopCondition[1024];
-
+__global__ void checkStopCondition(signed char* speed, signed char* phi, int parentThreadID, int HEIGHT, int WIDTH, int stopConditionVar);
 
 int main(int argc, char* argv[])
 {
@@ -256,10 +254,8 @@ int main(int argc, char* argv[])
 	}
 	cudaDeviceSynchronize();
 
-
 	// Stop the segmentation timer
 	cudaEventRecord(stopTime2, 0);
-
 
 	// Retrieve results from the GPU
 	signed char* phi = new signed char[numRepetitions*numLabels*HEIGHT*WIDTH];
@@ -407,10 +403,10 @@ __global__ void evolveContour(unsigned char* intensity, unsigned char* labels, s
         initSpeedPhi<<<dimGrid, dimBlock>>>(intensity, labels, speed, phi, HEIGHT, WIDTH, targetLabels[tid], lowerIntensityBounds[tid], upperIntensityBounds[tid]);
 
         int numIterations = 0;
-        stopCondition[tid] = 1;
-        while(stopCondition[tid])
+	int stopConditionVar = 1;
+        while(stopConditionVar)
         {
-                stopCondition[tid] = 0;
+                stopConditionVar = 0;
                 numIterations++;
 
                 dimGrid.x = WIDTH/30+1;
@@ -427,14 +423,17 @@ __global__ void evolveContour(unsigned char* intensity, unsigned char* labels, s
                 {
                         dimGrid.x = WIDTH/32+1;
                         dimGrid.y = HEIGHT/32+1;
-                        checkStopCondition<<<dimGrid, dimBlock>>>(speed, phi, tid, HEIGHT, WIDTH);
+                        checkStopCondition<<<dimGrid, dimBlock>>>(speed, phi, tid, HEIGHT, WIDTH, stopConditionVar);
                         cudaDeviceSynchronize();
                 }
 		else
-			stopCondition[tid] = 1;
+			stopConditionVar = 1;
 
-                if(stopCondition[tid] == 0)
+                if(stopConditionVar == 0)
+		{
                 	printf("Target label %d (intensities: %d-%d) converged in %d iterations.\n", targetLabels[tid], lowerIntensityBounds[tid], upperIntensityBounds[tid], numIterations);
+			break;
+		}
 	}
 }
 
@@ -592,7 +591,7 @@ __global__ void switchOut(signed char* speed, signed char* phi, int HEIGHT, int 
 }
 
 
-__global__ void checkStopCondition(signed char* speed, signed char* phi, int parentThreadID, int HEIGHT, int WIDTH)
+__global__ void checkStopCondition(signed char* speed, signed char* phi, int parentThreadID, int HEIGHT, int WIDTH, int stopConditionVar)
 {
 	int tx = threadIdx.x;
 	int ty = threadIdx.y;
@@ -613,8 +612,10 @@ __global__ void checkStopCondition(signed char* speed, signed char* phi, int par
 	}
 
 	// Falsify stop condition if criteria are not met
-	if(phiReg == 1 && speedReg > 0)
-		stopCondition[parentThreadID]++;
-	else if(phiReg == -1 && speedReg < 0)
-		stopCondition[parentThreadID]++;
+	if(phiReg == 1 && speedReg > 0){
+		stopConditionVar = 1;
+	}
+	else if(phiReg == -1 && speedReg < 0){
+		stopConditionVar = 1;
+	}
 }
