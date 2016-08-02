@@ -4,6 +4,7 @@
 #include "image.h"
 
 #define BUF_SIZE 256
+#define MAX_ITER 1000
 
 using namespace std;
 
@@ -28,7 +29,8 @@ __global__ void initSpeedPhi(unsigned char* intensity, unsigned char* labels, si
 __global__ void switchIn(signed char* speed, signed char* phi, int HEIGHT, int WIDTH);
 __global__ void switchOut(signed char* speed, signed char* phi, int HEIGHT, int WIDTH);
 
-__global__ void checkStopCondition(signed char* speed, signed char* phi, int parentThreadID, int HEIGHT, int WIDTH, int stopConditionVar);
+__global__ void checkStopCondition(signed char* speed, signed char* phi, int parentThreadID, int HEIGHT, int WIDTH);
+__device__ volatile int stopCondition[1024];
 
 int main(int argc, char* argv[])
 {
@@ -37,7 +39,7 @@ int main(int argc, char* argv[])
 	char* labelFile = NULL;
 	char* paramFile = NULL;
 	int numRepetitions = 1;
-	bool produceOutput = false;
+	//bool produceOutput = false;
 
 	for(int i=1; i<argc; i++)
 	{
@@ -92,8 +94,8 @@ int main(int argc, char* argv[])
 				exit(1);
 			}
 		}
-		else if(strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0)
-			produceOutput = true;
+		//else if(strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0)
+			//produceOutput = true;
 		else if(strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0)
 		{
 			cout << "Usage: " << argv[0] << " [OPTIONS] --image <file> --labels <file> --params <file>" << endl;
@@ -267,34 +269,53 @@ int main(int argc, char* argv[])
 
 
 	// Output RGB images (if command line switch was present)
-	if(produceOutput == true)
+	//if(produceOutput == true)
+	if (true)
 	{
-		srand(time(NULL));
-		Color colors[HEIGHT*WIDTH];
-		for(int i=0; i<HEIGHT; i++)
-			for(int j=0; j<WIDTH; j++)
-				colors[i*WIDTH+j] = randomColor();
-
-		for(int k=0; k<numLabels; k++)
-		{
-			image<Color> output = image<Color>(WIDTH, HEIGHT, true);
-			image<Color>* im = &output;
-			for(int i=0; i<HEIGHT; i++)
-				for(int j=0; j<WIDTH; j++)
-					im->access[i][j] = colors[phi[k*HEIGHT*WIDTH+i*WIDTH+j]];
-			
-			char filename[64];
-			sprintf(filename, "segmented.target_label-%d.intensities-%d-%d.ppm", targetLabels[k], lowerIntensityBounds[k], upperIntensityBounds[k]);
-			savePPM(im, filename);
+		Color color;
+	
+		srand(1000);
+	
+		// Create 1 image for all labels
+		image<Color> output = image<Color>(WIDTH, HEIGHT, true);
+		image<Color>* im = &output;
+		
+		// Initialize image (same as input)
+		for(int i = 0 ; i < HEIGHT ; i++) {
+			for(int j = 0 ; j < WIDTH ; j++){
+				color.r = intensity[i*WIDTH+j];
+				color.g = intensity[i*WIDTH+j];
+				color.b = intensity[i*WIDTH+j];
+				im->access[i][j] = color;
+			}
 		}
+		for(int k = 0 ; k < numLabels ; k++) {
+			Color randomcolor = randomColor();
+			for(int i = 0 ; i < HEIGHT ; i++) {
+				for(int j = 0 ; j < WIDTH ; j++){					
+					if (phi[k*HEIGHT*WIDTH+i*WIDTH+j] == -1){
+						color = randomcolor;
+						im->access[i][j] = color;
+					} else if (phi[k*HEIGHT*WIDTH+i*WIDTH+j] == -3){
+						color.r = randomcolor.r + 50;
+						color.g = randomcolor.g + 50;
+						color.b = randomcolor.b + 50;
+						im->access[i][j] = color;
+					}
+				}
+			}
+		}	
+		char filename[64];
+		sprintf(filename, "result.ppm");
+		savePPM(im, filename);
 	}
 
 
         // Stop runtime timer and print times
 	cudaEventElapsedTime(&elapsedTime1, startTime1, stopTime1);
 	cudaEventElapsedTime(&elapsedTime2, startTime2, stopTime2);
-	cout << "Computation time: " << setprecision(6) << elapsedTime2 << " ms"<< endl;
-	cout << "Total time: " << setprecision(6) << elapsedTime1 << " ms"<< endl;
+	cout << "Kernel Execution Time: " << setprecision(6) << elapsedTime2 << " ms"<< endl;
+	cout << "Total GPU Execution Time: " << setprecision(6) << elapsedTime1 << " ms"<< endl;
 	
 
 	// Free resources and end the program
@@ -403,10 +424,11 @@ __global__ void evolveContour(unsigned char* intensity, unsigned char* labels, s
         initSpeedPhi<<<dimGrid, dimBlock>>>(intensity, labels, speed, phi, HEIGHT, WIDTH, targetLabels[tid], lowerIntensityBounds[tid], upperIntensityBounds[tid]);
 
         int numIterations = 0;
-	int stopConditionVar = 1;
-        while(stopConditionVar)
+	
+	stopCondition[tid] = 1;
+        while(stopCondition[tid] && numIterations < MAX_ITER)
         {
-                stopConditionVar = 0;
+                stopCondition[tid] = 0;
                 numIterations++;
 
                 dimGrid.x = WIDTH/30+1;
@@ -423,18 +445,15 @@ __global__ void evolveContour(unsigned char* intensity, unsigned char* labels, s
                 {
                         dimGrid.x = WIDTH/32+1;
                         dimGrid.y = HEIGHT/32+1;
-                        checkStopCondition<<<dimGrid, dimBlock>>>(speed, phi, tid, HEIGHT, WIDTH, stopConditionVar);
+                        checkStopCondition<<<dimGrid, dimBlock>>>(speed, phi, tid, HEIGHT, WIDTH);
                         cudaDeviceSynchronize();
                 }
-		else
-			stopConditionVar = 1;
-
-                if(stopConditionVar == 0)
+		else 
 		{
-                	printf("Target label %d (intensities: %d-%d) converged in %d iterations.\n", targetLabels[tid], lowerIntensityBounds[tid], upperIntensityBounds[tid], numIterations);
-			break;
+			stopCondition[tid] = 1;
 		}
-	}
+        }
+	printf("Target label %d (intensities: %d-%d) converged in %d iterations.\n", targetLabels[tid], lowerIntensityBounds[tid], upperIntensityBounds[tid], numIterations);
 }
 
 
@@ -590,8 +609,7 @@ __global__ void switchOut(signed char* speed, signed char* phi, int HEIGHT, int 
 
 }
 
-
-__global__ void checkStopCondition(signed char* speed, signed char* phi, int parentThreadID, int HEIGHT, int WIDTH, int stopConditionVar)
+__global__ void checkStopCondition(signed char* speed, signed char* phi, int parentThreadID, int HEIGHT, int WIDTH)
 {
 	int tx = threadIdx.x;
 	int ty = threadIdx.y;
@@ -601,21 +619,35 @@ __global__ void checkStopCondition(signed char* speed, signed char* phi, int par
 	int xPos = 32*bx + tx;
 	int yPos = 32*by + ty;
 
-	int speedReg;
-	int phiReg;
+	signed char speedReg;
+	signed char phiReg;
+
+	__shared__ int stop;
+
+	stop = 0;
+	__syncthreads();
 
 	// Load data into shared memory and registers
 	if(xPos < WIDTH && yPos < HEIGHT)
 	{
 		speedReg = speed[yPos*WIDTH+xPos];
 		phiReg = phi[yPos*WIDTH+xPos];
+
+		// Falsify stop condition if criteria are not met
+		if(phiReg == 1 && speedReg > 0)
+		{
+			stop = 1;
+		} 
+		else if(phiReg == -1 && speedReg < 0)
+		{
+			stop = 1;
+		}
+	}
+		__syncthreads();
+
+	if (tx==0 && ty ==0 && stop && xPos < WIDTH && yPos < HEIGHT){
+		stopCondition[parentThreadID] = 1;
+		__threadfence();
 	}
 
-	// Falsify stop condition if criteria are not met
-	if(phiReg == 1 && speedReg > 0){
-		stopConditionVar = 1;
-	}
-	else if(phiReg == -1 && speedReg < 0){
-		stopConditionVar = 1;
-	}
 }
